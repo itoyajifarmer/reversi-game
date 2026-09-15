@@ -25,6 +25,15 @@ const POSITION_WEIGHTS = [
   [120, -28, 18, 8, 8, 18, -28, 120],
 ];
 
+const CORNERS = [
+  [0, 0],
+  [0, SIZE - 1],
+  [SIZE - 1, 0],
+  [SIZE - 1, SIZE - 1],
+];
+
+const STRONGEST_SEARCH_MS = 1200;
+
 const state = {
   board: createInitialBoard(),
   current: BLACK,
@@ -129,6 +138,10 @@ function countDiscs(board) {
     },
     { black: 0, white: 0 }
   );
+}
+
+function countEmpty(board) {
+  return board.flat().filter((cell) => cell === EMPTY).length;
 }
 
 function saveHistory() {
@@ -260,6 +273,10 @@ function chooseCpuMove(moves) {
     return moves[Math.floor(Math.random() * moves.length)];
   }
 
+  if (state.difficulty === "strongest") {
+    return chooseStrongestMove(moves);
+  }
+
   const scoredMoves = moves.map((move) => {
     const nextBoard = copyBoard(state.board);
     applyMoveOnBoard(nextBoard, move, WHITE);
@@ -279,6 +296,116 @@ function chooseCpuMove(moves) {
   return scoredMoves[0].move;
 }
 
+function chooseStrongestMove(moves) {
+  const startedAt = performance.now();
+  const emptyCount = countEmpty(state.board);
+  const searchDepth = getStrongestSearchDepth(emptyCount, moves.length);
+  const orderedMoves = orderMoves(state.board, moves, WHITE);
+  let bestMove = orderedMoves[0];
+  let bestScore = -Infinity;
+
+  for (const move of orderedMoves) {
+    const nextBoard = copyBoard(state.board);
+    applyMoveOnBoard(nextBoard, move, WHITE);
+
+    const score = minimax(
+      nextBoard,
+      BLACK,
+      searchDepth - 1,
+      -Infinity,
+      Infinity,
+      startedAt,
+      STRONGEST_SEARCH_MS
+    );
+
+    if (score > bestScore || (score === bestScore && compareMoves(move, bestMove) < 0)) {
+      bestScore = score;
+      bestMove = move;
+    }
+
+    if (performance.now() - startedAt > STRONGEST_SEARCH_MS) {
+      break;
+    }
+  }
+
+  return bestMove;
+}
+
+function getStrongestSearchDepth(emptyCount, moveCount) {
+  if (emptyCount <= 10) {
+    return emptyCount;
+  }
+  if (emptyCount <= 16) {
+    return 8;
+  }
+  if (emptyCount <= 28) {
+    return 6;
+  }
+  if (moveCount <= 5) {
+    return 6;
+  }
+  return 5;
+}
+
+function minimax(board, player, depth, alpha, beta, startedAt, timeLimitMs) {
+  const currentMoves = getValidMoves(board, player);
+  const opponentMoves = getValidMoves(board, -player);
+  const timedOut = performance.now() - startedAt > timeLimitMs;
+
+  if (timedOut || depth <= 0 || (currentMoves.length === 0 && opponentMoves.length === 0)) {
+    return evaluateBoard(board);
+  }
+
+  if (currentMoves.length === 0) {
+    return minimax(board, -player, depth - 1, alpha, beta, startedAt, timeLimitMs);
+  }
+
+  const orderedMoves = orderMoves(board, currentMoves, player);
+
+  if (player === WHITE) {
+    let value = -Infinity;
+
+    for (const move of orderedMoves) {
+      const nextBoard = copyBoard(board);
+      applyMoveOnBoard(nextBoard, move, player);
+      value = Math.max(value, minimax(nextBoard, BLACK, depth - 1, alpha, beta, startedAt, timeLimitMs));
+      alpha = Math.max(alpha, value);
+      if (beta <= alpha) {
+        break;
+      }
+    }
+
+    return value;
+  }
+
+  let value = Infinity;
+
+  for (const move of orderedMoves) {
+    const nextBoard = copyBoard(board);
+    applyMoveOnBoard(nextBoard, move, player);
+    value = Math.min(value, minimax(nextBoard, WHITE, depth - 1, alpha, beta, startedAt, timeLimitMs));
+    beta = Math.min(beta, value);
+    if (beta <= alpha) {
+      break;
+    }
+  }
+
+  return value;
+}
+
+function orderMoves(board, moves, player) {
+  return [...moves].sort((a, b) => {
+    const scoreA = estimateMovePriority(board, a, player);
+    const scoreB = estimateMovePriority(board, b, player);
+    const scoreDelta = player === WHITE ? scoreB - scoreA : scoreA - scoreB;
+    return scoreDelta || compareMoves(a, b);
+  });
+}
+
+function compareMoves(a, b) {
+  return a.row - b.row || a.col - b.col;
+}
+
 function applyMoveOnBoard(board, move, player) {
   board[move.row][move.col] = player;
   for (const [row, col] of move.flips) {
@@ -295,6 +422,93 @@ function scoreMove(board, move) {
   return positionScore + flipScore + mobility * 4 + pieceBalance;
 }
 
+function estimateMovePriority(board, move, player) {
+  const nextBoard = copyBoard(board);
+  applyMoveOnBoard(nextBoard, move, player);
+  const playerSign = player === WHITE ? 1 : -1;
+  const mobility = getValidMoves(nextBoard, player).length - getValidMoves(nextBoard, -player).length;
+  const cornerBonus = isCorner(move.row, move.col) ? 420 : 0;
+  return (POSITION_WEIGHTS[move.row][move.col] + move.flips.length * 8 + mobility * 10 + cornerBonus) * playerSign;
+}
+
+function evaluateBoard(board) {
+  const scores = countDiscs(board);
+  const emptyCount = countEmpty(board);
+  const blackMoves = getValidMoves(board, BLACK).length;
+  const whiteMoves = getValidMoves(board, WHITE).length;
+
+  if (blackMoves === 0 && whiteMoves === 0) {
+    return (scores.white - scores.black) * 100000;
+  }
+
+  const positionScore = getPositionScore(board);
+  const cornerScore = getCornerScore(board) * 540;
+  const mobilityScore = (whiteMoves - blackMoves) * 42;
+  const frontierScore = (countFrontierDiscs(board, BLACK) - countFrontierDiscs(board, WHITE)) * 22;
+  const discWeight = emptyCount <= 16 ? 92 : emptyCount <= 28 ? 18 : 6;
+  const discScore = (scores.white - scores.black) * discWeight;
+  const parityScore = emptyCount % 2 === 0 ? -10 : 10;
+
+  return positionScore + cornerScore + mobilityScore + frontierScore + discScore + parityScore;
+}
+
+function getPositionScore(board) {
+  let score = 0;
+
+  for (let row = 0; row < SIZE; row += 1) {
+    for (let col = 0; col < SIZE; col += 1) {
+      if (board[row][col] === WHITE) {
+        score += POSITION_WEIGHTS[row][col];
+      }
+      if (board[row][col] === BLACK) {
+        score -= POSITION_WEIGHTS[row][col];
+      }
+    }
+  }
+
+  return score;
+}
+
+function getCornerScore(board) {
+  return CORNERS.reduce((score, [row, col]) => {
+    if (board[row][col] === WHITE) {
+      return score + 1;
+    }
+    if (board[row][col] === BLACK) {
+      return score - 1;
+    }
+    return score;
+  }, 0);
+}
+
+function countFrontierDiscs(board, player) {
+  let count = 0;
+
+  for (let row = 0; row < SIZE; row += 1) {
+    for (let col = 0; col < SIZE; col += 1) {
+      if (board[row][col] !== player) {
+        continue;
+      }
+
+      const touchesEmpty = DIRECTIONS.some(([rowStep, colStep]) => {
+        const nextRow = row + rowStep;
+        const nextCol = col + colStep;
+        return isInside(nextRow, nextCol) && board[nextRow][nextCol] === EMPTY;
+      });
+
+      if (touchesEmpty) {
+        count += 1;
+      }
+    }
+  }
+
+  return count;
+}
+
+function isCorner(row, col) {
+  return (row === 0 || row === SIZE - 1) && (col === 0 || col === SIZE - 1);
+}
+
 function maybeRunCpu() {
   clearCpuTimer();
   if (state.gameOver || state.mode !== "cpu" || state.current !== WHITE) {
@@ -309,7 +523,7 @@ function maybeRunCpu() {
   }
 
   state.locked = true;
-  state.message = "白が考えています。";
+  state.message = state.difficulty === "strongest" ? "白が本気で考えています。" : "白が考えています。";
   render();
 
   state.cpuTimer = window.setTimeout(() => {
